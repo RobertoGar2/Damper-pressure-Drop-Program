@@ -1,0 +1,19 @@
+# SAMPLE DATA - made-up free areas for demonstrating the program.
+# Replace with measured free areas (from CAD, measurement, or the
+# manufacturer's free-area table).
+#
+# One row per size. Sizes listed here use this free area directly.
+# Use 'Calibrate geometry' in the Free area tab to fit geometry.json
+# to these values, so sizes NOT listed get a matching estimate.
+width_in,height_in,free_area_ft2
+8,8,0.10
+10,10,0.23
+12,12,0.42
+16,16,0.93
+18,18,1.29
+24,24,2.61
+30,30,4.38
+36,24,4.14
+36,36,6.59
+48,24,5.67
+48,48,12.38

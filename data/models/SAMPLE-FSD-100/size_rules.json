@@ -1,0 +1,10 @@
+{
+  "_notes": "SAMPLE size rules. Sizes in inches; use null for no limit. A damper larger than the max section size is split into equal sections, each with its own frame and blades. joint_blockage_in is extra width blocked along each joint between sections (mullion, connecting angles), beyond the section frames.",
+  "min_width_in": 8,
+  "min_height_in": 8,
+  "max_width_in": 144,
+  "max_height_in": 96,
+  "max_section_width_in": 48,
+  "max_section_height_in": 48,
+  "joint_blockage_in": 0.5
+}

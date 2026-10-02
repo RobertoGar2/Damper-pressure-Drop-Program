@@ -1,0 +1,9 @@
+{
+  "_description": "SAMPLE - galvanized frame, 3V blades (made-up data)",
+  "_notes": "Frame and blade dimensions used to estimate free area for sizes that are not in free_area_data.csv or the test data. Use Calibrate geometry in the Free area tab to fit these to measured free areas. All values in inches (other_blockage in square inches). Blades are assumed horizontal and fully open. PLACEHOLDER VALUES - replace with your damper's dimensions.",
+  "frame_obstruction_width_in": 1.5,
+  "frame_obstruction_height_in": 1.5,
+  "blade_thickness_in": 0.5,
+  "blade_pitch_in": 6.0,
+  "other_blockage_in2": 0.0
+}

@@ -1,0 +1,46 @@
+# SAMPLE DATA - made-up numbers for demonstrating the program.
+# Replace with real AMCA 500-D test data before using the results.
+#
+# One row per test point. Test data is assumed to be at standard air
+# (0.075 lb/ft3), which is how AMCA test reports present it.
+# Keep all data from the same test configuration (e.g. AMCA 5.3).
+#
+# Optional column free_area_ft2: fill it in (same value on every row of
+# a size) to use a measured free area instead of the geometry estimate.
+width_in,height_in,face_velocity_fpm,pressure_drop_in_wg,free_area_ft2
+12,12,500,0.050,
+12,12,1000,0.201,
+12,12,1500,0.445,
+12,12,2000,0.776,
+12,12,2500,1.229,
+12,12,3000,1.741,
+18,18,500,0.021,
+18,18,1000,0.087,
+18,18,1500,0.186,
+18,18,2000,0.329,
+18,18,2500,0.531,
+18,18,3000,0.761,
+24,24,500,0.014,
+24,24,1000,0.054,
+24,24,1500,0.124,
+24,24,2000,0.226,
+24,24,2500,0.332,
+24,24,3000,0.491,
+36,24,500,0.011,
+36,24,1000,0.044,
+36,24,1500,0.097,
+36,24,2000,0.181,
+36,24,2500,0.274,
+36,24,3000,0.413,
+36,36,500,0.009,
+36,36,1000,0.036,
+36,36,1500,0.076,
+36,36,2000,0.144,
+36,36,2500,0.228,
+36,36,3000,0.330,
+48,48,500,0.007,
+48,48,1000,0.029,
+48,48,1500,0.064,
+48,48,2000,0.114,
+48,48,2500,0.189,
+48,48,3000,0.257,

@@ -1,0 +1,13 @@
+# SAMPLE - blades per section by SECTION height (in).
+# Heights in a range include both ends. A height on a boundary shared by
+# two rows uses the lower row. Leave no gaps between rows (e.g. 10-15.99, 16-21.99).
+# Sections outside the table use the blade pitch in geometry.json.
+min_height_in,max_height_in,blades
+6,9.99,1
+10,15.99,2
+16,21.99,3
+22,27.99,4
+28,33.99,5
+34,39.99,6
+40,45.99,7
+46,48,8
