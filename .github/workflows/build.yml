@@ -1,0 +1,70 @@
+# Builds the standalone Windows program on GitHub's servers.
+#
+# - Every push and pull request: runs the tests and builds DamperDP.exe.
+#   The result is downloadable from the run's page (Actions tab > run > Artifacts).
+# - Pushing a version tag (e.g. v0.2.0): also publishes a GitHub Release
+#   with DamperDP-windows.zip attached.
+
+name: Build Windows exe
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:        # adds a "Run workflow" button in the Actions tab
+
+permissions:
+  contents: write           # needed to create the release
+
+env:
+  PYTHONUTF8: "1"           # show ² and other symbols correctly in the logs
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest
+
+      - name: Build the exe
+        run: pyinstaller --noconfirm --onefile --windowed --name DamperDP main.py
+
+      - name: Package exe with data folder
+        shell: pwsh
+        run: |
+          $pkg = "package\DamperDP"
+          New-Item -ItemType Directory -Force $pkg | Out-Null
+          Copy-Item dist\DamperDP.exe $pkg
+          Copy-Item -Recurse data "$pkg\data"
+          Copy-Item README.md, LICENSE $pkg
+          Compress-Archive -Path $pkg -DestinationPath DamperDP-windows.zip
+
+      - name: Upload build (downloadable from the run page)
+        uses: actions/upload-artifact@v4
+        with:
+          name: DamperDP-windows
+          path: package/
+          retention-days: 30
+
+      - name: Publish release (version tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: DamperDP-windows.zip
+          generate_release_notes: true
