@@ -19,7 +19,9 @@ It handles multiple damper models (product lines), each with its own test data, 
 - **Free-area estimator** with a drawing of the damper face and a breakdown of what blocks the opening (frame, blades, other)
 - Measured free-area table, used directly for the sizes it lists
 - **Geometry calibration**: fits frame, blade and blockage dimensions to your measured free areas, so every other size gets a consistent estimate
-- Estimates for untested sizes using a size model fitted across all tested sizes
+- Estimates for untested sizes using a size model fitted across all tested sizes, as a straight line or a physically shaped curve (chosen per model, both shown for comparison)
+- Smooth results next to tested sizes: untested sizes blend towards the nearest tested size's own coefficient, so the estimate doesn't jump
+- Fit diagnostics for every tested size: the fitted exponent n of ΔP = kVⁿ and the residual of every test point
 - Air density correction for temperature and altitude
 - Warnings when an estimate is an extrapolation beyond the test data
 - Command-line interface for quick lookups or scripting
@@ -30,8 +32,8 @@ It handles multiple damper models (product lines), each with its own test data, 
 Requires Python 3.10 or newer.
 
 ```bash
-git clone https://github.com/<your-username>/damper-pressure-drop.git
-cd damper-pressure-drop
+git clone https://github.com/RobertoGar2/Damper-pressure-Drop-Program.git
+cd Damper-pressure-Drop-Program
 pip install -r requirements.txt
 python main.py
 ```
@@ -121,6 +123,7 @@ Tips for good results:
 - Use **4 or more velocities per size**, covering the range you'll estimate.
 - Keep all data from the **same test configuration** (for example, AMCA 500-D figure 5.3). Pressure drop differs noticeably between configurations.
 - Test data is assumed to be at **standard air** (0.075 lb/ft³), which is how AMCA test reports present it.
+- Check the **n** column in the Test data & model tab (or `--list`). It is the exponent of ΔP = kVⁿ fitted to each size and should be close to 2. A value outside 1.8 to 2.2 is flagged, because the velocity-squared fit then hides a problem with the data. The residuals show how far each test point is from the fit.
 
 ## Free area
 
@@ -143,7 +146,7 @@ For sizes not in the table, the free area is calculated from the model's `geomet
 | `frame_obstruction_width_in` | Frame/sleeve obstruction on each side (left and right), in |
 | `frame_obstruction_height_in` | Frame/sleeve obstruction on each side (top and bottom), in |
 | `blade_thickness_in` | Blade thickness facing the airflow when fully open, in |
-| `blade_pitch_in` | Blade spacing, in. Blade count = open height / pitch, rounded up. Only used for section heights not in the blade table. |
+| `blade_pitch_in` | Blade spacing, in. Blade count = **open** height (section height minus the top and bottom frame) / pitch, rounded up. Only used for section heights not in the blade table, which is looked up by the **nominal** section height. |
 | `other_blockage_in2` | Other blockage per section (linkage, jackshaft, blade stops), in² |
 
 ```
@@ -175,6 +178,7 @@ Edit it in the **Sizes & blades** tab (select a row to change it, or use the box
 - Each range includes both ends. A height on a boundary shared by two rows uses the lower row.
 - Leave no gaps between rows. With rows `10-14` and `15-20`, a 14.5" section falls in the gap and is reported as an error; write `10-14.99` instead.
 - Overlapping rows are rejected.
+- Heights in the table are **nominal section heights**, the way blade schedules are usually written. The pitch rule used outside the table works on the open height instead, because blades only fill the clear opening.
 - Sections taller or shorter than the whole table fall back to the blade pitch, with a warning on the estimate.
 - An empty table (header only) means the blade pitch is always used.
 
@@ -190,7 +194,8 @@ Edit it in the **Sizes & blades** tab (select a row to change it, or use the box
   "max_height_in": 96,
   "max_section_width_in": 48,
   "max_section_height_in": 48,
-  "joint_blockage_in": 0.5
+  "joint_blockage_in": 0.5,
+  "size_model": "linear"
 }
 ```
 
@@ -200,12 +205,13 @@ Edit it in the **Sizes & blades** tab (select a row to change it, or use the box
 | `max_width_in`, `max_height_in` | Largest overall assembly made. Larger sizes are rejected. |
 | `max_section_width_in`, `max_section_height_in` | Largest single section. A damper bigger than this is split into the fewest **equal** sections that fit, across the width and/or height. |
 | `joint_blockage_in` | Extra width blocked along each joint between sections (mullion, connecting angles), beyond the sections' own frames. |
+| `size_model` | Shape of the size model: `linear` (default) or `curved`. See [How it works](#how-it-works). Set it in the **Sizes & blades** tab, or blank in Excel for linear. |
 
 Use `null` (or leave the box blank in the program) for no limit. With both section limits blank, the model is single-section only. Edit the rules in the **Sizes & blades** tab, where **Check a size** shows how a size will be split and how many blades each section gets before you save.
 
 Each section has its own frame, blades (from the blade table, by section height) and other blockage. For example, with 48" maximum sections, a 96" x 72" damper becomes 2 x 2 sections of 48" x 36". The Free area tab draws the sections.
 
-For pressure drop, each section of a multi-section damper sees the same face velocity, so the loss coefficient comes from the section size: its own test data if that section size was tested, otherwise the size model at the section's free-area ratio. The free area of the whole assembly, including joint blockage, sets the velocity.
+For pressure drop, the free area of the whole assembly, including joint blockage, sets the velocity. The loss coefficient comes from the size model at the free-area ratio of the whole assembly, joints included, because the joints block each section like extra frame. If the section size was tested, its own coefficient is used, adjusted by the size model for the joint blockage (with no joint blockage, it is exactly the tested section's coefficient).
 
 ## How it works
 
@@ -219,9 +225,25 @@ dP     = C_free x (rho / 0.075) x (V_free / 4005)^2
 
 `C_free` is fitted by least squares through the origin for each size.
 
-**2. Fit a size model.** Small dampers lose a larger share of their opening to the frame and blades, so their coefficient differs from large ones. With 3+ tested sizes, `C_free` is fitted as a straight line against the free-area ratio (`A_free / A_face`). The **Test data & model** tab shows this fit.
+**2. Fit a size model.** Small dampers lose a larger share of their opening to the frame and blades, so their coefficient differs from large ones. With 3+ tested sizes, `C_free` is fitted against the free-area ratio `R = A_free / A_face`, in one of two shapes set by the model's `size_model` rule:
 
-**3. Estimate.** A tested size uses its own fitted coefficient. Any other size uses the size model. The result is corrected for air density at the given temperature and altitude.
+```
+linear (default):  C_free = a + b x R
+curved:            C_free = a + b x (1/R - 1)^2
+```
+
+The curved shape is the shape of the classic loss coefficient of a grille or perforated plate: it rises steeply as `R` gets small, so it extrapolates more safely to sizes smaller than anything tested. The straight line can fit well inside the tested range but under-predicts small dampers outside it. Both are fitted every time, and the **Test data & model** tab plots both, so you can see which suits your data before choosing.
+
+**3. Estimate.** A tested size uses its own fitted coefficient. Any other size uses the size model, blended towards the nearest tested size when it is within 15% of it in both width and height:
+
+```
+C_free = C_model(R) + w x (C_tested - C_model(R_tested))
+w      = 1 at the tested size, falling linearly to 0 at 15% away
+```
+
+This keeps the estimate continuous next to a tested size instead of jumping from that size's own coefficient to the size model. The results show the size-model value, the nearest tested size and the weight. The result is corrected for air density at the given temperature and altitude.
+
+A free area typed into the Estimate tab uses the size model at that ratio, with no blending.
 
 The equivalent face-velocity coefficient is `C_face = C_free / (A_free / A_face)^2`, for comparison with catalog values.
 
@@ -254,6 +276,14 @@ pip install -r requirements-dev.txt
 python -m pytest
 ```
 
+## Calculation method document
+
+`docs/Damper_Pressure_Drop_Calculation_Method.pdf` explains the method step by step with worked examples. It is generated from the program itself, so its numbers always match the code. Rebuild it after changing the method or the sample data:
+
+```bash
+python docs/make_method_pdf.py
+```
+
 ## Project structure
 
 ```
@@ -270,6 +300,9 @@ damper-pressure-drop/
 │   └── models/             # one folder per damper model (sample data - replace)
 │       ├── SAMPLE-FSD-100/   # stored as CSV/JSON files
 │       └── SAMPLE-FSD-200/   # stored as one Excel workbook
+├── docs/
+│   ├── make_method_pdf.py  # builds the calculation-method PDF from the program
+│   └── Damper_Pressure_Drop_Calculation_Method.pdf
 ├── tests/
 │   └── test_model.py
 ├── .github/workflows/
@@ -281,11 +314,13 @@ damper-pressure-drop/
 
 ## Limitations
 
-- Estimates are only as good as the test data. Estimates outside the tested sizes or velocities are flagged as extrapolations and should be treated with caution.
+- Estimates are only as good as the test data. Estimates outside the tested sizes or velocities are flagged as extrapolations and should be treated with caution. Below the lowest tested velocity there is also a warning: loss coefficients tend to rise at low velocity (low Reynolds number), so the real pressure drop may be a little higher than the V² estimate.
+- A tested size's own estimate does not depend on its free area (the coefficient is fitted with the same free area, so the two cancel). Free area only matters for untested sizes. If an untested size next to a tested one gets a noticeably different pressure drop, compare their free areas first: calibrate the geometry so the geometry estimate agrees with the measured table.
+- The air density correction covers temperature and altitude only, not humidity (usually under 1%).
 - Models the damper fully open only (normal operation for fire/smoke dampers). It does not model partially closed blades.
 - The geometry estimate assumes a simple rectangular frame and horizontal blades of constant thickness. Calibrating against measured free areas absorbs most of the difference for real dampers.
 - Does not account for upstream or downstream fittings beyond the test configuration the data came from.
-- When comparing models, make sure their test data comes from the same AMCA test configuration, or the comparison is not like-for-like.
+- When comparing models, make sure their test data comes from the same AMCA test configuration, or the comparison is not like-for-like. Published data for UL 555S fire/smoke dampers is often AMCA 500-D figure 5.3 (ducted both sides); keep each model's data to one configuration.
 - Check results against manufacturer data before using them for design or submittals.
 
 ## License

@@ -622,3 +622,154 @@ def test_workbook_takes_priority_over_files(tmp_path):
     model = DamperModel.from_folder(folder)
     assert model.workbook_path == path
     assert model.fits[0].c_free == pytest.approx(0.4)
+
+
+# --- size-model shape, blending, joints in the coefficient, fit diagnostics ---
+
+import math  # noqa: E402
+
+from damper_dp.model import BLEND_RANGE, fit_exponent  # noqa: E402
+
+SIZES_4 = [(12, 12), (18, 18), (24, 24), (48, 48)]
+
+
+def test_curved_size_model_recovers_curved_trend():
+    c_of_ratio = lambda r: 0.25 + 0.6 * (1 / r - 1) ** 2  # noqa: E731
+    rules = ph.SizeRules(size_model="curved")
+    model = DamperModel(make_points(SIZES_4, c_of_ratio), size_rules=rules)
+    sm = model.size_model
+    assert sm.kind == "curved"
+    assert sm.intercept == pytest.approx(0.25, rel=1e-6)
+    assert sm.slope == pytest.approx(0.6, rel=1e-6)
+    assert model.alternate_size_model.kind == "linear"
+    est = model.estimate(30, 30, airflow_cfm=5000)
+    assert est.c_free == pytest.approx(c_of_ratio(est.free_ratio))
+
+
+def test_linear_size_model_is_the_default():
+    model = DamperModel(make_points(SIZES_4, lambda r: 0.9 - 0.8 * r))
+    assert model.size_rules.size_model == "linear"
+    assert model.size_model.kind == "linear"
+    assert set(model.size_models) == {"linear", "curved"}
+
+
+def test_bad_size_model_name_rejected():
+    with pytest.raises(ValueError):
+        ph.SizeRules(size_model="cubic").validate()
+
+
+def test_size_model_rule_round_trips_through_json_and_excel(tmp_path):
+    save_size_rules(ph.SizeRules(size_model="curved"), tmp_path / "size_rules.json")
+    assert load_size_rules(tmp_path / "size_rules.json").size_model == "curved"
+    folder, path = excel_model(tmp_path)
+    model = DamperModel.from_folder(folder)
+    model.save_rules(ph.SizeRules(size_model="curved"), model.blade_table)
+    assert DamperModel.from_folder(folder).size_model.kind == "curved"
+
+
+def test_blank_size_model_in_excel_means_linear(tmp_path):
+    folder, path = excel_model(tmp_path)
+    wb = openpyxl.load_workbook(path)
+    ws = wb["Size rules"]
+    for r in range(1, ws.max_row + 1):
+        if ws.cell(r, 1).value == "size_model":
+            ws.cell(r, 2).value = None
+    wb.save(path)
+    assert DamperModel.from_folder(folder).size_rules.size_model == "linear"
+
+
+def offset_model():
+    """Tested sizes on a straight line, except 24 x 24 sits 0.05 above it."""
+    line = lambda r: 0.9 - 0.8 * r  # noqa: E731
+    pts = make_points([(12, 12), (18, 18), (36, 36), (48, 48)], line)
+    pts += make_points([(24, 24)], lambda r: line(r) + 0.05)
+    return DamperModel(pts)
+
+
+def test_blending_is_continuous_at_a_tested_size():
+    model = offset_model()
+    at = model.estimate(24, 24, face_velocity_fpm=1000)
+    near = model.estimate(24.05, 24.05, face_velocity_fpm=1000)
+    assert at.tested is not None
+    assert near.tested is None
+    assert near.nearest_tested.label == "24 x 24"
+    assert near.c_free == pytest.approx(at.c_free, abs=0.002)
+
+
+def test_blend_fades_out_with_distance():
+    model = offset_model()
+    sm = model.size_model
+    weights = []
+    for w in (24.5, 25.5, 26.5):
+        est = model.estimate(w, w, face_velocity_fpm=1000)
+        weights.append(est.blend_weight)
+        expected = sm.c_free(est.free_ratio) + est.blend_weight * est.blend_offset
+        assert est.c_free == pytest.approx(expected)
+    assert weights[0] > weights[1] > weights[2] > 0
+    far = model.estimate(24 * (1 + BLEND_RANGE) * 1.01, 24 * (1 + BLEND_RANGE) * 1.01,
+                         face_velocity_fpm=1000)
+    assert far.blend_weight == 0
+    assert far.c_free == pytest.approx(sm.c_free(far.free_ratio))
+
+
+def test_free_area_override_does_not_blend():
+    model = offset_model()
+    est = model.estimate(24.5, 24.5, face_velocity_fpm=1000, free_area_override_ft2=2.8)
+    assert est.blend_weight == 0
+    assert est.c_free == pytest.approx(model.size_model.c_free(est.free_ratio))
+
+
+def test_joint_blockage_raises_multi_section_coefficient():
+    """The size model is read at the assembly's ratio, joints included."""
+    line = lambda r: 0.9 - 0.8 * r  # noqa: E731
+    pts = make_points([(12, 12), (18, 18), (30, 30), (40, 40)], line)
+    no_joint = DamperModel(pts, size_rules=ph.SizeRules(max_section_width_in=48))
+    joint = DamperModel(pts, size_rules=ph.SizeRules(max_section_width_in=48,
+                                                     joint_blockage_in=1.0))
+    a = no_joint.estimate(96, 36, face_velocity_fpm=1000)
+    b = joint.estimate(96, 36, face_velocity_fpm=1000)
+    assert b.free_ratio < a.free_ratio
+    assert b.coeff_ratio == pytest.approx(b.free_ratio)
+    assert b.c_free == pytest.approx(line(b.free_ratio))
+    assert b.c_free > a.c_free
+
+
+def test_tested_section_with_joints_is_adjusted_by_size_model():
+    line = lambda r: 0.9 - 0.8 * r  # noqa: E731
+    pts = make_points([(12, 12), (18, 18), (24, 24)], line)    # all single-section
+    rules = ph.SizeRules(max_section_width_in=24, max_section_height_in=24, joint_blockage_in=1.0)
+    model = DamperModel(pts, size_rules=rules)
+    est = model.estimate(48, 24, face_velocity_fpm=1500)
+    assert est.nearest_tested.label == "24 x 24"
+    assert est.blend_weight == pytest.approx(1.0)
+    assert est.c_free == pytest.approx(line(est.free_ratio))   # exact data on the line
+
+
+def test_fit_exponent_and_residuals():
+    model = DamperModel(make_points([(24, 24)], lambda r: 0.4))
+    fit = model.fits[0]
+    assert fit.exponent == pytest.approx(2.0)
+    assert fit.exponent_ok
+    assert all(abs(r) < 1e-9 for r in fit.residuals_pct)
+    v = [500.0, 1000.0, 2000.0, 3000.0]
+    assert fit_exponent(np_array(v), np_array([x ** 1.8 for x in v])) == pytest.approx(1.8)
+
+
+def test_exponent_far_from_two_warns():
+    pts = [DataPoint(24, 24, v, 1e-7 * v ** 1.6) for v in (500, 1000, 1500, 2000, 2500)]
+    model = DamperModel(pts)
+    assert not model.fits[0].exponent_ok
+    est = model.estimate(24, 24, face_velocity_fpm=1000)
+    assert any("V^1.60" in w for w in est.warnings)
+
+
+def test_low_velocity_warning():
+    model = DamperModel(make_points([(24, 24)], lambda r: 0.4))
+    assert model.estimate(24, 24, face_velocity_fpm=500).warnings == []
+    est = model.estimate(24, 24, face_velocity_fpm=300)
+    assert any("below the lowest tested velocity" in w for w in est.warnings)
+
+
+def np_array(x):
+    import numpy as np
+    return np.array(x, dtype=float)

@@ -24,7 +24,7 @@ from . import physics as ph  # noqa: E402
 from .model import (  # noqa: E402
     DamperModel, DataError, Estimate, ModelError, ModelLibrary,
     calibrate_geometry, compare_free_areas, comparison_stats, convert_to_workbook,
-    create_model_folder,
+    create_model_folder, BLEND_RANGE,
 )
 from .paths import (  # noqa: E402
     DATA_FILE, FREE_AREA_FILE, WORKBOOK_FILE, default_models_dir,
@@ -225,6 +225,7 @@ class App(tk.Tk):
             ("freesrc", "Free area from", 150),
             ("ratio", "Free %", 55), ("cfree", "C free", 65),
             ("cface", "C face", 65), ("r2", "R\u00b2", 55), ("vmax", "Max fpm", 65),
+            ("n", "n (V\u207f)", 60), ("resid", "Max resid.", 70),
         ]
         self.tree = ttk.Treeview(table, columns=[c[0] for c in columns],
                                  show="headings", height=14)
@@ -736,7 +737,12 @@ class App(tk.Tk):
             f"Data file:   {m.data_source}\n"
             f"Geometry:    {m.geometry_source}\n"
             f"Free areas:  {m.free_area_table_source} ({len(m.free_area_table)} sizes)\n"
-            f"Size model:  {m.size_model.describe()}"
+            f"Size model:  {m.size_model.describe()}  (in use)"
+            + (f"\nAlternative: {m.alternate_size_model.describe()}"
+               if m.alternate_size_model is not None else "")
+            + f"\nUntested sizes within {BLEND_RANGE:.0%} of a tested size blend towards its "
+              f"coefficient. n: exponent of dP = k V\u207f (should be near 2). "
+              f"Max resid.: largest test point vs. fit difference."
         )
 
         for i, f in enumerate(m.fits):
@@ -748,6 +754,9 @@ class App(tk.Tk):
                 f.free_area_source,
                 f"{f.free_ratio:.0%}", f"{f.c_free:.3f}", f"{f.c_face:.3f}", r2,
                 f"{f.v_face_max:,.0f}",
+                "n/a" if math.isnan(f.exponent) else
+                f"{f.exponent:.2f}" + ("" if f.exponent_ok else " !"),
+                "n/a" if math.isnan(f.max_residual_pct) else f"{f.max_residual_pct:+.1f}%",
             ))
 
         # Plot C_free against free-area ratio with the fitted size model.
@@ -760,9 +769,13 @@ class App(tk.Tk):
                         xytext=(6, 4), fontsize=8)
         sm = m.size_model
         span = max(sm.ratio_max - sm.ratio_min, 0.1)
-        x0, x1 = max(sm.ratio_min - 0.1 * span, 0.0), min(sm.ratio_max + 0.1 * span, 1.0)
-        ax.plot([x0, x1], [sm.c_free(x0), sm.c_free(x1)], "b-", lw=2,
-                label="Size model" if sm.kind == "linear" else "Average")
+        x0, x1 = max(sm.ratio_min - 0.1 * span, 0.05), min(sm.ratio_max + 0.1 * span, 1.0)
+        xs = [x0 + (x1 - x0) * i / 100 for i in range(101)]
+        ax.plot(xs, [sm.c_free(x) for x in xs], "b-", lw=2, label=f"{sm.label} (in use)")
+        alt = m.alternate_size_model
+        if alt is not None:
+            ax.plot(xs, [alt.c_free(x) for x in xs], color="gray", ls="--", lw=1.5,
+                    label=alt.label)
         ax.set_xlabel("Free-area ratio (free / face)")
         ax.set_ylabel("Loss coefficient C (free area)")
         ax.set_title("Loss coefficient vs. free-area ratio")
@@ -848,6 +861,13 @@ class App(tk.Tk):
             ("C (free area)", f"{est.c_free:.4f}"),
             ("C (face)", f"{est.c_face:.4f}"),
         ]
+        if not math.isnan(est.c_free_size_model):
+            rows.append(("C size model", f"{est.c_free_size_model:.4f} at R = {est.coeff_ratio:.1%}"))
+        if est.nearest_tested is not None:
+            n = est.nearest_tested
+            rows.append(("Nearest tested", f"{n.label}: C {n.c_free:.4f}, "
+                                           f"{est.blend_offset:+.4f} vs. size model, "
+                                           f"applied at {est.blend_weight:.0%}"))
         for key, val in rows:
             t.insert("end", f"{key:<20}{val}\n")
         t.insert("end", f"\nBasis: {est.source}\n")
@@ -916,6 +936,17 @@ class App(tk.Tk):
         row = 0
         for name, label in RULE_FIELDS:
             row = self._entry_row(box, row, label, self.rule_vars[name])
+        self.size_model_var = tk.StringVar(value="linear")
+        ttk.Label(box, text="Size model shape").grid(row=row, column=0, sticky="w", pady=2)
+        ttk.Combobox(box, textvariable=self.size_model_var, values=list(ph.SIZE_MODEL_KINDS),
+                     state="readonly", width=10).grid(row=row, column=1, sticky="ew", pady=2)
+        row += 1
+        ttk.Label(box, wraplength=300, foreground="gray", justify="left", text=(
+            "linear: C = a + b\u00b7R. curved: C = a + b\u00b7(1/R \u2212 1)\u00b2, which "
+            "rises steeply for small free-area ratios and extrapolates more safely. "
+            "Compare both on the Test data & model tab.")).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        row += 1
         ttk.Label(box, wraplength=300, foreground="gray", justify="left", text=(
             "Leave a limit blank for no limit. Leave both section limits blank "
             "for single-section dampers only. A damper larger than the maximum "
@@ -995,6 +1026,7 @@ class App(tk.Tk):
                 self.rule_vars[name].set(f"{value:g}")
             else:
                 self.rule_vars[name].set("" if value is None else f"{value:g}")
+        self.size_model_var.set(rules.size_model)
         self._blade_rows = list(model.blade_table.rules) if model is not None else []
         self._refresh_blade_tree()
         self.chk_result_var.set("")
@@ -1079,7 +1111,7 @@ class App(tk.Tk):
                 values[name] = 0.0 if v is None else v
             else:
                 values[name] = self._read(self.rule_vars[name], label, optional=True)
-        rules = ph.SizeRules(**values)
+        rules = ph.SizeRules(**values, size_model=self.size_model_var.get() or "linear")
         rules.validate()
         return rules
 

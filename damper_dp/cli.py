@@ -65,7 +65,9 @@ def print_fits(model: DamperModel) -> None:
     print(f"Data:       {model.data_source}   ({model.storage})")
     print(f"Geometry:   {model.geometry_source}")
     print(f"Free areas: {model.free_area_table_source} ({len(model.free_area_table)} sizes)")
-    print(f"Size model: {model.size_model.describe()}")
+    print(f"Size model: {model.size_model.describe()}  (in use)")
+    if model.alternate_size_model is not None:
+        print(f"   instead: {model.alternate_size_model.describe()}")
     print(f"Size rules: {model.size_rules.describe()}")
     if model.blade_table.is_empty:
         print(f"Blades:     blade pitch {model.geometry.blade_pitch_in:g} in (no blade table)\n")
@@ -73,12 +75,20 @@ def print_fits(model: DamperModel) -> None:
         rows = ", ".join(f"{r.label}: {r.blades}" for r in model.blade_table.rules)
         print(f"Blades:     {rows}  (section height: blades)\n")
     print(f"{'Size':>10} {'Pts':>4} {'Face ft2':>9} {'Free ft2':>9} {'Free %':>7} "
-          f"{'C free':>8} {'C face':>8} {'R2':>7}  Free area from")
+          f"{'C free':>8} {'C face':>8} {'R2':>7} {'n':>6}  Free area from")
     for f in model.fits:
         r2 = "n/a" if math.isnan(f.r2) else f"{f.r2:.3f}"
+        n = "n/a" if math.isnan(f.exponent) else f"{f.exponent:.2f}" + ("" if f.exponent_ok else "!")
         print(f"{f.label:>10} {f.n_points:>4} {f.face_area_ft2:>9.2f} {f.free_area_ft2:>9.2f} "
-              f"{f.free_ratio:>7.0%} {f.c_free:>8.3f} {f.c_face:>8.3f} {r2:>7}  "
+              f"{f.free_ratio:>7.0%} {f.c_free:>8.3f} {f.c_face:>8.3f} {r2:>7} {n:>6}  "
               f"{f.free_area_source}")
+    print("\nn: exponent of dP = k V^n fitted to each size (should be near 2; ! = check data).")
+    print("\nResiduals, (measured - fitted) / fitted, at each tested face velocity:")
+    for f in model.fits:
+        pts = ", ".join(
+            f"{v:,.0f}: {'n/a' if math.isnan(r) else f'{r:+.1f}%'}"
+            for v, r in zip(f.face_velocities_fpm, f.residuals_pct))
+        print(f"{f.label:>10}  {pts}")
 
 
 def print_geometry(g: ph.DamperGeometry) -> None:
@@ -275,6 +285,12 @@ def main(argv=None) -> int:
           f"{' per section' if est.n_sections > 1 else ''} ({est.blade_source})")
     print(f"  Air density        {est.air_density:.4f} lb/ft3")
     print(f"  C (free / face)    {est.c_free:.4f} / {est.c_face:.4f}")
+    if not math.isnan(est.c_free_size_model):
+        print(f"  C size model       {est.c_free_size_model:.4f} at R = {est.coeff_ratio:.1%}")
+    if est.nearest_tested is not None:
+        n = est.nearest_tested
+        print(f"  Nearest tested     {n.label}: C {n.c_free:.4f}, {est.blend_offset:+.4f} vs. "
+              f"size model, applied at {est.blend_weight:.0%}")
     print(f"  Basis              {est.source}")
     for w in est.warnings:
         print(f"  WARNING: {w}")

@@ -69,7 +69,13 @@ def face_area_ft2(width_in: float, height_in: float) -> float:
 
 
 def blade_count(height_in: float, geometry: DamperGeometry) -> int:
-    """Number of blades for a damper of the given height."""
+    """Number of blades from the blade pitch: open height / pitch, rounded up.
+
+    `height_in` is the nominal section height; the frame obstruction is taken
+    off top and bottom first, because blades only fill the clear opening.
+    (The blade table, by contrast, is looked up by the nominal section height,
+    the way blade schedules are usually written.)
+    """
     open_h = height_in - 2 * geometry.frame_obstruction_height_in
     if open_h <= 0:
         return 0
@@ -166,6 +172,13 @@ def section_blades(section_height_in: float, geometry: DamperGeometry,
 # Size rules and multi-section layout
 # ---------------------------------------------------------------------------
 
+# Shapes the size model (C_free vs. free-area ratio R) can take:
+#   linear: C = a + b * R
+#   curved: C = a + b * (1/R - 1)^2, the shape of the classic loss coefficient of
+#           a grille or perforated plate, which rises steeply as R gets small.
+SIZE_MODEL_KINDS = ("linear", "curved")
+
+
 @dataclass
 class SizeRules:
     """Size limits for a damper model, and when to split it into sections.
@@ -181,6 +194,7 @@ class SizeRules:
     max_section_width_in: float | None = None  # largest single section
     max_section_height_in: float | None = None
     joint_blockage_in: float = 0.0             # extra width blocked along each joint
+    size_model: str = "linear"                 # shape of C_free vs. free-area ratio
 
     @classmethod
     def from_dict(cls, data: dict) -> "SizeRules":
@@ -193,6 +207,9 @@ class SizeRules:
                 raise ValueError(
                     f"Unknown size rule '{key}'. Valid rules: {', '.join(sorted(known))}"
                 )
+            if key == "size_model":
+                values[key] = str(value or "linear").strip().lower() or "linear"
+                continue
             if value is None or value == "":
                 values[key] = 0.0 if key == "joint_blockage_in" else None
                 continue
@@ -206,8 +223,15 @@ class SizeRules:
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
     def validate(self) -> None:
+        if self.size_model not in SIZE_MODEL_KINDS:
+            raise ValueError(
+                f"Size rule 'size_model' must be one of: {', '.join(SIZE_MODEL_KINDS)} "
+                f"(got '{self.size_model}')."
+            )
         for f in fields(self):
             v = getattr(self, f.name)
+            if f.name == "size_model":
+                continue
             if f.name == "joint_blockage_in":
                 if v < 0:
                     raise ValueError("Joint blockage cannot be negative.")

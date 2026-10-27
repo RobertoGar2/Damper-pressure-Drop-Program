@@ -10,11 +10,15 @@ How the model works
 
 2. Size model: C_free changes with size because the frame and blades block
    a larger share of small dampers. With 3 or more tested sizes, C_free is
-   fitted as a straight line against the free-area ratio (free / face).
-   With fewer sizes, the average C_free is used.
+   fitted against the free-area ratio R (free / face), either as a straight
+   line (C = a + b*R, the default) or as a curve (C = a + b*(1/R - 1)^2),
+   chosen per model by the size_model rule. With fewer sizes, the average
+   C_free is used.
 
 3. Estimate: a tested size uses its own fitted C_free. Any other size uses
-   the size model. Pressure drop is then corrected for air density.
+   the size model, blended towards the nearest tested size's own
+   coefficient when it is within BLEND_RANGE, so the result does not jump
+   next to a tested size. Pressure drop is then corrected for air density.
 
 Damper models
 -------------
@@ -56,6 +60,14 @@ OPTIONAL_COLUMNS = ("free_area_ft2",)
 FREE_AREA_COLUMNS = ("width_in", "height_in", "free_area_ft2")
 SIZE_TOLERANCE_IN = 0.01    # sizes within this are treated as the same size
 PA_PER_IN_WG = 249.089
+# An untested size within this fraction of a tested size (in both width and
+# height) blends towards that size's own coefficient, so the estimate does not
+# jump between a tested size and its neighbours. Weight 1 at the tested size,
+# falling linearly to 0 at this distance.
+BLEND_RANGE = 0.15
+# A tested size whose pressure drop follows V^n with n outside 2 +/- this gets
+# a warning: the velocity-squared law may not describe it well.
+EXPONENT_TOLERANCE = 0.2
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +263,7 @@ def settings_from_pairs(pairs, source) -> dict:
         if t.lower() in _NO_LIMIT_WORDS:
             data[key] = None
             continue
-        if key == "description":
+        if key in ("description", "size_model"):
             data[key] = t
             continue
         try:
@@ -380,13 +392,17 @@ RULE_NOTES = {
                              "equal sections. Blank = never split up the height.",
     "joint_blockage_in": "Extra width blocked along each joint between sections (mullion, "
                          "angles), beyond the section frames (in). 0 = none.",
+    "size_model": "Shape of the size model: linear (C = a + b*R, default) or curved "
+                  "(C = a + b*(1/R - 1)^2). Blank = linear.",
 }
 GEOMETRY_NOTES = {
     "description": "Short description shown next to the model list (optional).",
     "frame_obstruction_width_in": "Frame/sleeve obstruction on EACH side, left and right (in).",
     "frame_obstruction_height_in": "Frame/sleeve obstruction on EACH side, top and bottom (in).",
     "blade_thickness_in": "Blade thickness facing the airflow when fully open (in).",
-    "blade_pitch_in": "Blade spacing (in). Only used for section heights not in the Blade table.",
+    "blade_pitch_in": "Blade spacing (in). Blades = open height (section height minus top and "
+                      "bottom frame) / pitch, rounded up. Only used for section heights not in "
+                      "the Blade table.",
     "other_blockage_in2": "Other blockage per section: linkage, jackshaft, stops (in2).",
 }
 
@@ -490,6 +506,20 @@ def fit_through_origin(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
     return c, r2
 
 
+def fit_exponent(v: np.ndarray, dp: np.ndarray) -> float:
+    """n in dP = k * V^n, fitted on log scales. nan with fewer than 3 usable points.
+
+    For turbulent flow through a damper n should be close to 2. A clearly
+    different value points to a problem with the data (or a low-velocity
+    effect) that the velocity-squared fit hides.
+    """
+    ok = (v > 0) & (dp > 0)
+    if ok.sum() < 3 or np.ptp(np.log(v[ok])) < 1e-6:
+        return math.nan
+    n, _ = np.polyfit(np.log(v[ok]), np.log(dp[ok]), 1)
+    return float(n)
+
+
 @dataclass
 class SizeFit:
     """Fitted loss coefficient for one tested damper size."""
@@ -503,6 +533,7 @@ class SizeFit:
     r2: float
     face_velocities_fpm: np.ndarray
     pressure_drops_in_wg: np.ndarray
+    exponent: float = math.nan      # n in dP = k * V^n, fitted on log scales
 
     @property
     def label(self) -> str:
@@ -511,6 +542,35 @@ class SizeFit:
     @property
     def free_ratio(self) -> float:
         return self.free_area_ft2 / self.face_area_ft2
+
+    @property
+    def fitted_in_wg(self) -> np.ndarray:
+        """Pressure drop the fit gives at each tested velocity (standard air)."""
+        v_free = self.face_velocities_fpm * self.face_area_ft2 / self.free_area_ft2
+        return self.c_free * ph.velocity_pressure(v_free)
+
+    @property
+    def residuals_pct(self) -> np.ndarray:
+        """(measured - fitted) / fitted for each test point, in %."""
+        fitted = self.fitted_in_wg
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(fitted > 0, (self.pressure_drops_in_wg - fitted) / fitted * 100,
+                            math.nan)
+
+    @property
+    def max_residual_pct(self) -> float:
+        """Largest residual by size, keeping its sign."""
+        r = self.residuals_pct
+        r = r[~np.isnan(r)]
+        return float(r[np.argmax(np.abs(r))]) if len(r) else math.nan
+
+    @property
+    def exponent_ok(self) -> bool:
+        return math.isnan(self.exponent) or abs(self.exponent - 2.0) <= EXPONENT_TOLERANCE
+
+    @property
+    def v_face_min(self) -> float:
+        return float(self.face_velocities_fpm.min())
 
     @property
     def c_face(self) -> float:
@@ -530,11 +590,23 @@ class SizeFit:
                 and abs(self.height_in - height_in) <= SIZE_TOLERANCE_IN)
 
 
+def size_model_x(kind: str, free_ratio):
+    """The variable the size model is linear in: R (linear) or (1/R - 1)^2 (curved)."""
+    r = np.asarray(free_ratio, dtype=float)
+    x = (1.0 / r - 1.0) ** 2 if kind == "curved" else r
+    return float(x) if x.ndim == 0 else x
+
+
 @dataclass
 class SizeModel:
-    """C_free as a function of free-area ratio, fitted across sizes."""
+    """C_free as a function of free-area ratio R, fitted across sizes.
 
-    kind: str            # "linear" or "constant"
+    linear:   C = intercept + slope * R
+    curved:   C = intercept + slope * (1/R - 1)^2
+    constant: C = intercept (fewer than 3 usable sizes)
+    """
+
+    kind: str            # "linear", "curved" or "constant"
     intercept: float
     slope: float
     r2: float
@@ -544,14 +616,22 @@ class SizeModel:
     face_area_max: float
 
     def c_free(self, free_ratio: float) -> float:
-        return self.intercept + self.slope * free_ratio
+        if self.kind == "constant":
+            return self.intercept
+        return self.intercept + self.slope * size_model_x(self.kind, free_ratio)
+
+    @property
+    def label(self) -> str:
+        return {"linear": "Linear size model", "curved": "Curved size model",
+                "constant": "Average coefficient"}[self.kind]
 
     def describe(self) -> str:
-        if self.kind == "linear":
+        if self.kind in ("linear", "curved"):
             sign = "+" if self.slope >= 0 else "-"
+            term = "R" if self.kind == "linear" else "(1/R - 1)\u00b2"
             return (
-                f"C_free = {self.intercept:.4f} {sign} {abs(self.slope):.4f} x (free-area ratio)"
-                f"   R\u00b2 = {self.r2:.3f}, fitted to ratios "
+                f"{self.kind}: C_free = {self.intercept:.4f} {sign} {abs(self.slope):.4f} x {term}"
+                f"   R\u00b2 = {self.r2:.3f}, fitted to free-area ratios R = "
                 f"{self.ratio_min:.0%} to {self.ratio_max:.0%}"
             )
         return (
@@ -585,6 +665,12 @@ class Estimate:
     sections_high: int = 1
     blades_per_section: int = 0
     blade_source: str = ""
+    # How C_free was put together, for display:
+    c_free_size_model: float = math.nan     # size model at coeff_ratio
+    coeff_ratio: float = math.nan           # free-area ratio the size model was read at
+    nearest_tested: SizeFit | None = None   # tested size used for the coefficient, if any
+    blend_weight: float = 0.0               # 1 = that size's own C, 0 = size model only
+    blend_offset: float = 0.0               # nearest tested C minus the size model at its ratio
 
     @property
     def n_sections(self) -> int:
@@ -829,8 +915,10 @@ class DamperModel:
         self.free_area_table = list(free_area_table or [])
         self.free_area_table_source = free_area_table_source
         self.fits = self._fit_sizes()
+        self.size_models = self._fit_size_models()
         self.size_model = self._fit_size_model()
         self.max_tested_face_velocity = max(p.face_velocity_fpm for p in self.points)
+        self.min_tested_face_velocity = min(p.face_velocity_fpm for p in self.points)
 
     @classmethod
     def from_files(cls, data_path, geometry_path=None, free_area_path=None, *,
@@ -998,10 +1086,16 @@ class DamperModel:
             vp_free = ph.velocity_pressure(v * face / free)
             c_free, r2 = fit_through_origin(vp_free, dp)
 
-            fits.append(SizeFit(w, h, face, free, source, c_free, r2, v, dp))
+            fits.append(SizeFit(w, h, face, free, source, c_free, r2, v, dp,
+                                exponent=fit_exponent(v, dp)))
         return fits
 
-    def _fit_size_model(self) -> SizeModel:
+    def _fit_size_models(self) -> dict[str, SizeModel]:
+        """Both size-model shapes, fitted to the tested sizes.
+
+        Returns {"linear": ..., "curved": ...}. With fewer than 3 sizes, or
+        ratios too close together, both are the constant (average) model.
+        """
         ratios = np.array([f.free_ratio for f in self.fits])
         cs = np.array([f.c_free for f in self.fits])
         faces = np.array([f.face_area_ft2 for f in self.fits])
@@ -1009,13 +1103,31 @@ class DamperModel:
         a_lo, a_hi = float(faces.min()), float(faces.max())
 
         if len(self.fits) >= 3 and hi - lo >= 0.02:
-            slope, intercept = np.polyfit(ratios, cs, 1)
-            pred = intercept + slope * ratios
+            models = {}
             ss_tot = float(np.sum((cs - cs.mean()) ** 2))
-            r2 = 1.0 - float(np.sum((cs - pred) ** 2)) / ss_tot if ss_tot > 0 else math.nan
-            return SizeModel("linear", float(intercept), float(slope), r2, lo, hi, a_lo, a_hi)
+            for kind in ph.SIZE_MODEL_KINDS:
+                x = size_model_x(kind, ratios)
+                slope, intercept = np.polyfit(x, cs, 1)
+                pred = intercept + slope * x
+                r2 = 1.0 - float(np.sum((cs - pred) ** 2)) / ss_tot if ss_tot > 0 else math.nan
+                models[kind] = SizeModel(kind, float(intercept), float(slope), r2,
+                                         lo, hi, a_lo, a_hi)
+            return models
 
-        return SizeModel("constant", float(cs.mean()), 0.0, math.nan, lo, hi, a_lo, a_hi)
+        const = SizeModel("constant", float(cs.mean()), 0.0, math.nan, lo, hi, a_lo, a_hi)
+        return {kind: const for kind in ph.SIZE_MODEL_KINDS}
+
+    def _fit_size_model(self) -> SizeModel:
+        """The size model this model uses (its size_model rule)."""
+        return self.size_models[self.size_rules.size_model]
+
+    @property
+    def alternate_size_model(self) -> SizeModel | None:
+        """The size-model shape not in use, for comparison (None if constant)."""
+        if self.size_model.kind == "constant":
+            return None
+        other = "curved" if self.size_model.kind == "linear" else "linear"
+        return self.size_models[other]
 
     # -- estimating ---------------------------------------------------------
 
@@ -1024,6 +1136,22 @@ class DamperModel:
             if f.matches(width_in, height_in):
                 return f
         return None
+
+    def nearest_tested(self, width_in: float, height_in: float) -> tuple[SizeFit | None, float]:
+        """The tested size closest to this size, and its blend weight.
+
+        Distance is the larger of the width and height differences on a log
+        scale (so 10% bigger and 10% smaller count the same). The weight is 1
+        at the tested size and falls linearly to 0 at BLEND_RANGE away.
+        """
+        best, best_w = None, 0.0
+        limit = math.log(1 + BLEND_RANGE)
+        for f in self.fits:
+            d = max(abs(math.log(width_in / f.width_in)), abs(math.log(height_in / f.height_in)))
+            w = max(0.0, 1.0 - d / limit)
+            if w > best_w:
+                best, best_w = f, w
+        return best, best_w
 
     def _coefficient(self, width_in, height_in, free_area_override):
         if width_in <= 0 or height_in <= 0:
@@ -1064,14 +1192,14 @@ class DamperModel:
         layout_note = (f" ({bd.sections_wide} x {bd.sections_high} sections of "
                        f"{bd.section_width_in:.4g} x {bd.section_height_in:.4g} in)") if multi else ""
 
-        # A multi-section damper whose section size was tested uses that fit:
-        # each section sees the same face velocity as the tested damper.
-        section_tested = None
-        if multi and not tested and free_area_override is None:
-            section_tested = self.find_size(bd.section_width_in, bd.section_height_in)
+        sm = self.size_model
+        info = {"c_size_model": math.nan, "coeff_ratio": ratio, "nearest": None, "weight": 0.0,
+                "offset": 0.0}
 
         if tested and free_area_override is None:
             c_free = tested.c_free
+            info.update(c_size_model=sm.c_free(ratio), nearest=tested, weight=1.0,
+                        offset=tested.c_free - sm.c_free(ratio))
             r2 = "n/a" if math.isnan(tested.r2) else f"{tested.r2:.3f}"
             source = f"Test data for the {tested.label} size (R\u00b2 = {r2})"
             if tested.n_points < 3:
@@ -1079,36 +1207,66 @@ class DamperModel:
                     f"Only {tested.n_points} test point(s) for this size, "
                     f"so its fit is not well constrained."
                 )
-        elif section_tested is not None:
-            c_free = section_tested.c_free
-            source = f"Test data for the {section_tested.label} section size{layout_note}"
         else:
-            sm = self.size_model
-            # Look up C at the ratio of one section, so a large multi-section
-            # damper is treated like its sections rather than a giant single one.
-            c_ratio = ratio + bd.joint_block_in2 / bd.face_area_in2 if multi else ratio
-            c_free = sm.c_free(c_ratio)
-            source = ("Size model fitted across tested sizes" if sm.kind == "linear"
-                      else "Average coefficient of tested sizes") + layout_note
-            if c_ratio < sm.ratio_min - 0.005 or c_ratio > sm.ratio_max + 0.005:
-                warnings.append(
-                    f"Free-area ratio {c_ratio:.0%} is outside the tested range "
-                    f"({sm.ratio_min:.0%} to {sm.ratio_max:.0%}), so this is an extrapolation."
-                )
-            section_face = face / bd.n_sections
-            if section_face < sm.face_area_min * 0.95 or section_face > sm.face_area_max * 1.05:
-                what = "Section face area" if multi else "Face area"
-                warnings.append(
-                    f"{what} {section_face:.2f} ft\u00b2 is outside the tested sizes "
-                    f"({sm.face_area_min:.2f} to {sm.face_area_max:.2f} ft\u00b2)."
-                )
+            # The size model is read at the damper's own free-area ratio. For a
+            # multi-section damper that is the ratio of the whole assembly,
+            # including joint blockage: each section's share of the joints
+            # blocks it like extra frame, so it raises the coefficient too.
+            c_ratio = ratio
+            c_line = sm.c_free(c_ratio)
+            info.update(c_size_model=c_line, coeff_ratio=c_ratio)
+
+            # Blend towards the nearest tested size (or, for a multi-section
+            # damper, the tested size nearest its sections), keeping that
+            # size's offset from the size model: weight 1 gives exactly its
+            # own coefficient (adjusted for any difference in ratio).
+            near, weight = (None, 0.0)
+            if free_area_override is None:
+                ref = (bd.section_width_in, bd.section_height_in) if multi else (width_in, height_in)
+                near, weight = self.nearest_tested(*ref)
+            if near is not None and weight > 0:
+                offset = near.c_free - sm.c_free(near.free_ratio)
+                c_free = c_line + weight * offset
+                info.update(nearest=near, weight=weight, offset=offset)
+                what = "section size" if multi else "size"
+                if weight >= 1.0 - 1e-9:
+                    source = (f"Test data for the {near.label} {what}{layout_note}, "
+                              f"adjusted to this ratio by the size model")
+                else:
+                    source = (f"{sm.label} blended {weight:.0%} towards the tested "
+                              f"{near.label} {what}{layout_note}")
+            else:
+                c_free = c_line
+                source = sm.label + (" fitted across tested sizes" if sm.kind != "constant"
+                                     else " of tested sizes") + layout_note
+
+            if weight < 1.0 - 1e-9:
+                if c_ratio < sm.ratio_min - 0.005 or c_ratio > sm.ratio_max + 0.005:
+                    warnings.append(
+                        f"Free-area ratio {c_ratio:.0%} is outside the tested range "
+                        f"({sm.ratio_min:.0%} to {sm.ratio_max:.0%}), so this is an extrapolation."
+                    )
+                section_face = face / bd.n_sections
+                if section_face < sm.face_area_min * 0.95 or section_face > sm.face_area_max * 1.05:
+                    what = "Section face area" if multi else "Face area"
+                    warnings.append(
+                        f"{what} {section_face:.2f} ft\u00b2 is outside the tested sizes "
+                        f"({sm.face_area_min:.2f} to {sm.face_area_max:.2f} ft\u00b2)."
+                    )
             if c_free <= 0:
                 raise ModelError(
                     f"The size model gives a non-positive loss coefficient ({c_free:.3f}) "
                     f"at a {c_ratio:.0%} free-area ratio, far outside the tested range. "
                     f"Add test data for a size closer to this one."
                 )
-        return face, free, free_source, c_free, source, warnings, tested, bd
+
+        near = info["nearest"]
+        if near is not None and not near.exponent_ok:
+            warnings.append(
+                f"Test data for {near.label} follows V^{near.exponent:.2f} rather than V^2, "
+                f"so the velocity-squared fit may not describe it well. Check its test points."
+            )
+        return face, free, free_source, c_free, source, warnings, tested, bd, info
 
     def estimate(self, width_in: float, height_in: float, *,
                  airflow_cfm: float | None = None,
@@ -1120,7 +1278,7 @@ class DamperModel:
         if (airflow_cfm is None) == (face_velocity_fpm is None):
             raise ModelError("Give either an airflow (cfm) or a face velocity (fpm), not both.")
 
-        face, free, free_source, c_free, source, warnings, tested, bd = self._coefficient(
+        face, free, free_source, c_free, source, warnings, tested, bd, info = self._coefficient(
             width_in, height_in, free_area_override_ft2)
 
         if airflow_cfm is not None:
@@ -1149,6 +1307,13 @@ class DamperModel:
                 f"Face velocity {v_face:,.0f} fpm is above the highest tested velocity "
                 f"({v_max:,.0f} fpm), so this is an extrapolation."
             )
+        v_min = tested.v_face_min if tested else self.min_tested_face_velocity
+        if v_face < v_min * 0.95:
+            warnings.append(
+                f"Face velocity {v_face:,.0f} fpm is below the lowest tested velocity "
+                f"({v_min:,.0f} fpm). Loss coefficients tend to rise at low velocity, "
+                f"so the real pressure drop may be somewhat higher."
+            )
 
         return Estimate(
             width_in=float(width_in), height_in=float(height_in),
@@ -1161,6 +1326,9 @@ class DamperModel:
             warnings=warnings, tested=tested,
             sections_wide=bd.sections_wide, sections_high=bd.sections_high,
             blades_per_section=bd.n_blades, blade_source=bd.blade_source,
+            c_free_size_model=info["c_size_model"], coeff_ratio=info["coeff_ratio"],
+            nearest_tested=info["nearest"], blend_weight=info["weight"],
+            blend_offset=info["offset"],
         )
 
 
